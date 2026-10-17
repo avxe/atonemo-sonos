@@ -7,8 +7,11 @@ import Testing
     var nowPlaying: [String: String] = [:]  // room: uri
     var calls: [String] = []
     var refuseVolume = false
+    var playing = true
 
     func currentURI() async throws -> String { nowPlaying[room] ?? "" }
+    func isPlaying() async throws -> Bool { playing }
+    func resume() async throws { calls.append("resume \(room)") }
     func play(_ uri: String, title: String) async throws {
         calls.append("play \(title) in \(room)")
         nowPlaying[room] = radioURI(uri)
@@ -62,6 +65,44 @@ let t0 = Date(timeIntervalSince1970: 0)
     #expect(sonos.calls == ["volume 15", "play NTS Live 1 in Living Room"])
 }
 
+@MainActor @Test func streamErrorKeepsSonosPlaying() async throws {
+    let sonos = FakeSonos()
+    let bridge = try await started(sonos)
+    var tries = 0
+    bridge.resumePlayer = { _ in tries += 1 }
+    _ = try await bridge.step(nts1, volume: 50, now: t0 + 1)
+    _ = try await bridge.step(.failed, volume: 50, now: t0 + 2)  // the player's stream broke; nobody pressed stop
+    #expect(tries == 0)  // waits 3 s first
+    for t in 3..<120 { _ = try await bridge.step(.failed, volume: 50, now: t0 + TimeInterval(t)) }
+    #expect(tries == 3)  // at 5, 17 and 47 s, then it leaves it
+    #expect(!sonos.calls.contains { $0.hasPrefix("stop") })
+}
+
+@MainActor @Test func resumedStreamRestartsSonosOnlyIfItStopped() async throws {
+    let sonos = FakeSonos()
+    let bridge = try await started(sonos)
+    bridge.resumePlayer = { _ in }
+    _ = try await bridge.step(nts1, volume: 50, now: t0 + 1)
+    _ = try await bridge.step(.failed, volume: 50, now: t0 + 2)
+    _ = try await bridge.step(.failed, volume: 50, now: t0 + 5)
+    _ = try await bridge.step(nts1, volume: 50, now: t0 + 7)  // the player has it back, Sonos never stopped
+    #expect(!sonos.calls.contains("resume Living Room"))
+    _ = try await bridge.step(.failed, volume: 50, now: t0 + 8)
+    sonos.playing = false  // this time Sonos lost the stream too
+    _ = try await bridge.step(nts1, volume: 50, now: t0 + 12)
+    #expect(sonos.calls.last == "resume Living Room")
+}
+
+@MainActor @Test func streamErrorAtStartCountsAsStopped() async throws {
+    let sonos = FakeSonos()
+    let bridge = Bridge(sonos: sonos, maxVolume: 30)
+    bridge.resumePlayer = { _ in Issue.record("nothing to resume") }
+    _ = try await bridge.step(.failed, volume: 50, now: t0)
+    _ = try await bridge.step(.failed, volume: 50, now: t0 + 10)
+    _ = try await bridge.step(nts1, volume: 50, now: t0 + 11)  // a button press plays as usual
+    #expect(sonos.calls == ["volume 15", "play NTS Live 1 in Living Room"])
+}
+
 @MainActor @Test func oldChangeNeverPlays() async throws {
     let sonos = FakeSonos()
     let bridge = try await started(sonos)
@@ -102,6 +143,8 @@ let t0 = Date(timeIntervalSince1970: 0)
         "resources": [["uri": "https://stream-relay-geo.ntslive.net/stream2"]], "metaData": ["serviceID": "atonemoNts"]]]]]
     #expect(ntsStream(data) == .nts(uri: "https://stream-relay-geo.ntslive.net/stream2", title: "NTS Live 2"))
     #expect(ntsStream(["value": ["state": "stopped"]]) == .off)
+    #expect(ntsStream(["value": ["state": "stopped", "streamerError": [String: Any]()]]) == .off)  // a stop press
+    #expect(ntsStream(["value": ["state": "stopped", "streamerError": ["domain": "gstreamerResourceError", "code": -19]]]) == .failed)
     #expect(ntsStream(["value": ["state": "transitioning"]]) == .switching)
     #expect(ntsStream(["value": NSNull()]) == .switching)
     let untitled: [String: Any] = ["value": ["state": "playing", "trackRoles": ["title": "", "mediaData": [

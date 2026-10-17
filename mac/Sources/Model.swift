@@ -259,6 +259,10 @@ enum SonosState: Equatable {
         if sonos == nil {
             let sonos = Sonos(room: room)
             (self.sonos, bridge) = (sonos, Bridge(sonos: sonos, maxVolume: maxVolume))
+            bridge?.resumePlayer = { [weak self] uri in
+                guard let self, let player = self.player, let channel = self.channels.first(where: { $0.plays(uri) }) else { return }
+                try await player.play(channel)
+            }
         }
         sonos?.speakers = roomIPs
         if roomIPs[room] == nil {
@@ -314,7 +318,8 @@ enum SonosState: Equatable {
             if uri.hasPrefix("x-sonos-htastream:") {
                 state = .tv
             } else if transportState == "PLAYING" || transportState == "TRANSITIONING" {
-                state = playerURI.map(radioURI) == uri ? .ours : .other
+                let streams = [playerURI, last?.stream].compactMap { $0 }  // last: the player may be recovering
+                state = streams.contains { radioURI($0) == uri } ? .ours : .other
             } else {
                 state = .stopped
             }

@@ -4,7 +4,7 @@ Play the [Atonemo NTS Radio Player](https://atonemo.com/products/nts) on Sonos.
 
 ![The menu bar app, light and dark](screenshot.png)
 
-Use the player as usual. Its stations, volume knob and stop button drive Sonos. Sonos streams straight from NTS and never starts music by itself.
+Use the player as usual. Its stations, volume knob and stop button drive Sonos. Sonos streams straight from NTS, picks the stream up again after a dropout, and never starts music by itself.
 
 ## Mac
 

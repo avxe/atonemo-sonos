@@ -15,7 +15,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from html import escape
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 NTS_SERVICE = "atonemoNts"  # serviceID the player reports for NTS streams
 POLL = 0.5                  # seconds between player reads
@@ -23,6 +23,8 @@ RETRY = 5                   # seconds to wait after an error
 REDISCOVER_AFTER = 6        # errors in a row before looking for devices again
 STALE = 60                  # seconds without a reading before changes stop counting
 SWITCHING = "switching"     # player is between streams; wait for it
+FAILED = "failed"           # player stopped because its stream broke, not because of a stop press
+RESUME_AFTER = (3, 12, 30)  # seconds before each try to give the player its stream back
 
 
 def log(msg):
@@ -94,11 +96,11 @@ def discover():
 # --- Atonemo -----------------------------------------------------------------
 
 def nts_stream(data):
-    """Player data -> (uri, title) while NTS plays, None when not, or SWITCHING."""
+    """Player data -> (uri, title) while NTS plays, None when not, SWITCHING, or FAILED."""
     value = (data or {}).get("value") or {}
     state = value.get("state")
     if state in ("stopped", "paused"):
-        return None
+        return FAILED if value.get("streamerError") else None  # the error stays until the next play
     if state != "playing":
         return SWITCHING
     track = value.get("trackRoles") or {}
@@ -114,6 +116,7 @@ class Player:
 
     def __init__(self, ip):
         self.ip = ip
+        self.media = None  # what the player last played, to ask for it again
 
     def get(self, path):
         query = urllib.parse.urlencode({"path": path, "roles": "@all"})
@@ -121,9 +124,23 @@ class Player:
 
     def read(self):
         """Return (stream, volume 0-100)."""
-        stream = nts_stream(self.get("player:player/data"))
+        data = self.get("player:player/data")
+        stream = nts_stream(data)
+        if isinstance(stream, tuple):
+            self.media = (data.get("value") or {}).get("mediaRoles") or self.media
         volume = (self.get("player:volume").get("value") or {}).get("i32_") or 0
         return stream, volume
+
+    def resume(self):
+        """Play the last stream again, the way its own button does."""
+        if not self.media:
+            return
+        body = {"path": "player:player/control", "role": "activate",
+                "value": {"control": "play", "mediaRoles": self.media}}
+        reply = json.loads(http(f"http://{self.ip}/api/setData", json.dumps(body).encode(),
+                                {"Content-Type": "application/json"}) or b"null")
+        if isinstance(reply, dict) and reply.get("error"):
+            raise RuntimeError(f"Player refused to play: {reply['error'].get('message') or reply['error']}")
 
 
 # --- Sonos -------------------------------------------------------------------
@@ -221,6 +238,10 @@ class Sonos:
     def current_uri(self):
         return soap(self.coordinator(), "AVTransport", "GetMediaInfo", InstanceID=0)["CurrentURI"]
 
+    def playing(self):
+        state = soap(self.coordinator(), "AVTransport", "GetTransportInfo", InstanceID=0)["CurrentTransportState"]
+        return state in ("PLAYING", "TRANSITIONING")
+
     def send(self, service, *calls):
         if self.dry_run:
             return
@@ -236,6 +257,9 @@ class Sonos:
     def stop(self):
         self.send("AVTransport", ("Stop", {}))
 
+    def resume(self):
+        self.send("AVTransport", ("Play", {"Speed": 1}))  # same stream, from where it broke
+
     def set_volume(self, volume):
         self.send("GroupRenderingControl",
                   ("SnapshotGroupVolume", {}),  # keeps the balance between grouped rooms
@@ -247,11 +271,14 @@ class Sonos:
 class Bridge:
     """Turns changes on the player into Sonos commands."""
 
-    def __init__(self, sonos, max_volume=30):
+    def __init__(self, sonos, max_volume=30, resume=None):
         self.sonos, self.max_volume = sonos, max_volume
-        self.uri = None     # stream the player plays, or None
-        self.volume = None  # knob position
-        self.seen = None    # time of the last reading handled without error
+        self.resume = resume  # asks the player for its last stream again
+        self.uri = None       # stream the player plays, or None
+        self.title = "NTS"
+        self.volume = None    # knob position
+        self.seen = None      # time of the last reading handled without error
+        self.lost = None      # (time of the next try, tries so far) while the player has lost its stream
 
     def ours(self):
         return self.uri is not None and self.sonos.current_uri() == radio_uri(self.uri)
@@ -259,11 +286,16 @@ class Bridge:
     def step(self, stream, volume, now=None):
         now = time.time() if now is None else now
         fresh = self.seen is not None and now - self.seen <= STALE
-        if stream == SWITCHING:
+        if stream in (SWITCHING, FAILED):
             if fresh:
                 self.seen = now
+                if stream == FAILED:
+                    self.recover(now)
+            elif stream == FAILED:
+                self.uri, self.volume, self.seen = None, volume, now  # found broken: same as stopped
             return
         uri = stream[0] if stream else None
+        lost, self.lost = self.lost, None
         if not fresh:
             # First reading, or none for a minute (computer asleep, device offline,
             # Sonos failing): take the player as it is, so old changes never start music.
@@ -276,15 +308,33 @@ class Bridge:
                 except RuntimeError as e:  # e.g. a room with fixed volume
                     log(f"{e}. Playing anyway.")
                 self.sonos.play(*stream)
+                self.title = stream[1]
                 log(f"{stream[1]} -> Sonos")
             elif self.ours():
                 self.sonos.stop()
                 log("Stopped -> Sonos stopped")
             self.uri = uri
+        elif uri and lost and self.ours() and not self.sonos.playing():
+            self.sonos.resume()  # Sonos lost the stream too; the player has it back
+            log(f"{self.title} -> Sonos again")
         elif uri and volume != self.volume and self.ours():
             self.sonos.set_volume(self.scale(volume))
             log(f"Volume {volume} -> {self.scale(volume)}")
         self.volume, self.seen = volume, now
+
+    def recover(self, now):
+        """The player lost its stream. Sonos keeps playing, and the player gets the stream back."""
+        if self.uri is None or self.resume is None:
+            return
+        if self.lost is None:
+            self.lost = (now + RESUME_AFTER[0], 0)
+            log("Player lost the stream. Sonos keeps playing.")
+        when, tries = self.lost
+        if tries < len(RESUME_AFTER) and now >= when:
+            tries += 1
+            self.lost = (now + RESUME_AFTER[tries] if tries < len(RESUME_AFTER) else when, tries)
+            log(f"{self.title} -> player again (try {tries} of {len(RESUME_AFTER)})")
+            self.resume()
 
     def scale(self, volume):
         return (volume * self.max_volume + 50) // 100  # round half up, like the Mac app
@@ -308,7 +358,7 @@ def run(args):
     if room not in rooms:
         sys.exit(f"Pick a room with --room: {', '.join(sorted(rooms))}")
     player, sonos = Player(players[0]), Sonos(rooms[room], room, args.dry_run)
-    bridge = Bridge(sonos, args.max_volume)
+    bridge = Bridge(sonos, args.max_volume, resume=(lambda: None) if args.dry_run else player.resume)
     log(f"Player {player.ip} -> Sonos '{room}'{' (dry run)' if args.dry_run else ''}. Use the knobs.")
 
     errors, last_error = 0, None

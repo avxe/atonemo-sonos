@@ -53,7 +53,9 @@ func fetch(_ url: URL, body: Data? = nil, headers: [String: String] = [:], timeo
 func ntsStream(_ data: [String: Any]) -> Reading {
     let value = data["value"] as? [String: Any] ?? [:]
     let state = value["state"] as? String
-    if state == "stopped" || state == "paused" { return .off }
+    if state == "stopped" || state == "paused" {  // a stream error stays until the next play
+        return (value["streamerError"] as? [String: Any])?.isEmpty == false ? .failed : .off
+    }
     guard state == "playing" else { return .switching }
     let track = value["trackRoles"] as? [String: Any] ?? [:]
     let media = track["mediaData"] as? [String: Any] ?? [:]
@@ -252,6 +254,15 @@ func allRooms(_ speakers: [String]) async -> [String: String] {
 
     func stop() async throws {
         try await soap(coordinator(), "AVTransport", "Stop", ["InstanceID": "0"])
+    }
+
+    func isPlaying() async throws -> Bool {
+        let state = try await soap(coordinator(), "AVTransport", "GetTransportInfo", ["InstanceID": "0"])["CurrentTransportState"]
+        return state == "PLAYING" || state == "TRANSITIONING"
+    }
+
+    func resume() async throws {  // same stream, from where it broke
+        try await soap(coordinator(), "AVTransport", "Play", ["InstanceID": "0", "Speed": "1"])
     }
 
     func setVolume(_ volume: Int) async throws {

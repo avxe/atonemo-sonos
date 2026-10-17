@@ -1,6 +1,6 @@
 import unittest
 
-from atonemo_sonos import SWITCHING, Bridge, didl, nts_stream, parse_rooms, radio_uri
+from atonemo_sonos import FAILED, SWITCHING, Bridge, didl, nts_stream, parse_rooms, radio_uri
 
 NTS1 = "https://stream-relay-geo.ntslive.net/stream?client=NTSAtonemo"
 NTS2 = "https://stream-relay-geo.ntslive.net/stream2?client=NTSAtonemo"
@@ -16,10 +16,16 @@ def player_data(state, uri=NTS1, title="NTS Live 1", service="atonemoNts"):
 
 class FakeSonos:
     def __init__(self):
-        self.now_playing, self.calls = "", []
+        self.now_playing, self.calls, self.is_playing = "", [], True
 
     def current_uri(self):
         return self.now_playing
+
+    def playing(self):
+        return self.is_playing
+
+    def resume(self):
+        self.calls.append(("resume",))
 
     def play(self, uri, title):
         self.calls.append(("play", title))
@@ -43,6 +49,11 @@ class PlayerParsing(unittest.TestCase):
 
     def test_switching(self):
         self.assertEqual(nts_stream(player_data("transitioning")), SWITCHING)
+
+    def test_stream_error(self):
+        broken = {"value": {"state": "stopped", "streamerError": {"domain": "gstreamerResourceError", "code": -19}}}
+        self.assertEqual(nts_stream(broken), FAILED)
+        self.assertIsNone(nts_stream({"value": {"state": "stopped", "streamerError": {}}}))  # a stop press
 
     def test_other_source(self):
         self.assertIsNone(nts_stream(player_data("playing", service="airplay")))
@@ -181,6 +192,46 @@ class BridgeLogic(unittest.TestCase):
         del self.sonos.play
         bridge.step((NTS1, "NTS Live 1"), 50, now=75)  # plugged back in: no surprise music
         self.assertNotIn(("play", "NTS Live 1"), self.sonos.calls)
+
+    def test_stream_error_keeps_sonos_playing(self):
+        tries = []
+        bridge = Bridge(self.sonos, max_volume=30, resume=lambda: tries.append(1))
+        bridge.step(None, 50, now=0)
+        bridge.step((NTS1, "NTS Live 1"), 50, now=1)
+        bridge.step(FAILED, 50, now=2)  # the player's stream broke; nobody pressed stop
+        self.assertEqual(tries, [])     # waits 3 s first
+        for t in range(3, 120):
+            bridge.step(FAILED, 50, now=t)
+        self.assertEqual(len(tries), 3)  # at 5, 17 and 47 s, then it leaves it
+        self.assertNotIn(("stop",), self.sonos.calls)
+
+    def test_resumed_stream_restarts_sonos_only_if_it_stopped(self):
+        bridge = Bridge(self.sonos, max_volume=30, resume=lambda: None)
+        bridge.step(None, 50, now=0)
+        bridge.step((NTS1, "NTS Live 1"), 50, now=1)
+        bridge.step(FAILED, 50, now=2)
+        bridge.step(FAILED, 50, now=5)
+        bridge.step((NTS1, "NTS Live 1"), 50, now=7)  # the player has it back, Sonos never stopped
+        self.assertNotIn(("resume",), self.sonos.calls)
+        bridge.step(FAILED, 50, now=8)
+        self.sonos.is_playing = False  # this time Sonos lost the stream too
+        bridge.step((NTS1, "NTS Live 1"), 50, now=12)
+        self.assertEqual(self.sonos.calls[-1], ("resume",))
+
+    def test_stream_error_at_start_counts_as_stopped(self):
+        bridge = Bridge(self.sonos, max_volume=30, resume=lambda: self.fail("nothing to resume"))
+        bridge.step(FAILED, 50, now=0)
+        bridge.step(FAILED, 50, now=10)
+        bridge.step((NTS1, "NTS Live 1"), 50, now=11)  # a button press plays as usual
+        self.assertEqual(self.sonos.calls, [("volume", 15), ("play", "NTS Live 1")])
+
+    def test_new_station_after_stream_error(self):
+        bridge = Bridge(self.sonos, max_volume=30, resume=lambda: None)
+        bridge.step(None, 50, now=0)
+        bridge.step((NTS1, "NTS Live 1"), 50, now=1)
+        bridge.step(FAILED, 50, now=2)
+        bridge.step((NTS2, "NTS Live 2"), 50, now=4)
+        self.assertEqual(self.sonos.calls[-1], ("play", "NTS Live 2"))
 
     def test_switching_keeps_reading_fresh(self):
         bridge = Bridge(self.sonos, max_volume=30)
