@@ -1,0 +1,23 @@
+# Install:
+#   sudo install -m 755 atonemo_sonos.py /usr/local/bin/atonemo-sonos
+#   sudo cp atonemo-sonos.service /etc/systemd/system/
+#   sudo systemctl enable --now atonemo-sonos
+# Change options:
+#   sudo systemctl edit --full atonemo-sonos && sudo systemctl restart atonemo-sonos
+# Logs:
+#   journalctl -u atonemo-sonos -f
+
+[Unit]
+Description=Atonemo NTS Radio Player to Sonos
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# Add --room "Living Room" if you have more than one Sonos room.
+ExecStart=/usr/local/bin/atonemo-sonos
+DynamicUser=yes
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
